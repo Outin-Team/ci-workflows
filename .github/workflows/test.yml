@@ -1,0 +1,18 @@
+name: Test CI Workflows
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Verify embedded workflow scripts are in sync
+        run: python3 scripts/sync_workflows_embed.py --check
+      - name: Run unit tests
+        run: python3 -m unittest discover -s tests -p "test_*.py" -v

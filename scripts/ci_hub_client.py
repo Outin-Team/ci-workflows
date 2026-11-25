@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""Lightweight stdlib GitHub Actions client for centralized Coolify CI Hub.
+
+Collects PRs, commit subjects, file stats, and compact diffs using the runner's
+built-in GITHUB_TOKEN and posts them to the centralized CI Hub HTTP endpoint.
+Falls back gracefully to direct Coolify + Feishu Webhook if CI_HUB_URL is unset.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import Counter
+from typing import Any
+
+NOISY_FILE_PATTERNS = (
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "poetry.lock",
+    "Cargo.lock",
+    "go.sum",
+    ".min.js",
+    ".min.css",
+    ".map",
+)
+
+MERGE_PR_RE = re.compile(r"^Merge pull request #\d+ from \S+", re.IGNORECASE)
+ZERO_SHA = "0" * 40
+
+
+def normalize_sha_short(sha: str) -> str:
+    cleaned = (sha or "").strip()
+    if cleaned.startswith("sha-"):
+        cleaned = cleaned[4:]
+    return cleaned[:7].lower()
+
+
+def clean_commit_message(message: str) -> str:
+    lines = [line.strip() for line in (message or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    if MERGE_PR_RE.match(lines[0]) and len(lines) > 1:
+        return lines[1]
+    return lines[0]
+
+
+def is_noisy_file(filename: str) -> bool:
+    lower = (filename or "").lower()
+    return any(lower.endswith(pat) or lower.rsplit("/", 1)[-1] == pat for pat in NOISY_FILE_PATTERNS)
+
+
+def summarize_modules(files: list[dict[str, Any]]) -> str:
+    counter: Counter[str] = Counter()
+    for item in files:
+        fname = item.get("filename") or ""
+        top = (fname.split("/", 1)[0] + "/") if "/" in fname else "(root)"
+        counter[top] += 1
+    return "、".join(f"`{mod}`({cnt})" for mod, cnt in counter.most_common(5)) if counter else ""
+
+
+def http_json(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    payload: dict[str, Any] | None = None,
+    timeout: int = 30,
+) -> tuple[int, Any]:
+    body = None
+    req_headers = dict(headers or {})
+    if payload is not None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req_headers.setdefault("Content-Type", "application/json; charset=utf-8")
+    req = urllib.request.Request(url, data=body, headers=req_headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return resp.status, json.loads(raw) if raw.strip() else {}
+    except urllib.error.HTTPError as exc:
+        err_text = exc.read().decode("utf-8", errors="replace")
+        try:
+            err_body = json.loads(err_text)
+        except Exception:
+            err_body = {"raw": err_text}
+        return exc.code, err_body
+
+
+def collect_change_context(
+    *,
+    repo: str,
+    sha: str,
+    before_sha: str,
+    event_name: str,
+    actor: str,
+    ref_name: str,
+    head_commit_message: str,
+    github_token: str,
+    api_base: str = "https://api.github.com",
+    server_url: str = "https://github.com",
+    http_fn=http_json,
+) -> dict[str, Any]:
+    sha_short = normalize_sha_short(sha)
+    gh_headers = {"Accept": "application/vnd.github+json", "User-Agent": "ci-workflows-client"}
+    if github_token:
+        gh_headers["Authorization"] = f"Bearer {github_token}"
+
+    prs: list[dict[str, Any]] = []
+    if github_token and repo and sha:
+        status, pr_data = http_fn(f"{api_base}/repos/{repo}/commits/{sha}/pulls", headers=gh_headers, timeout=15)
+        if status == 200 and isinstance(pr_data, list):
+            for pr in pr_data[:3]:
+                prs.append(
+                    {
+                        "number": pr.get("number"),
+                        "title": (pr.get("title") or "").strip(),
+                        "body": (pr.get("body") or "").strip()[:1200],
+                        "url": pr.get("html_url") or "",
+                        "author": (pr.get("user") or {}).get("login") or "",
+                    }
+                )
+
+    commits: list[dict[str, str]] = []
+    files: list[dict[str, Any]] = []
+    diff_url = f"{server_url}/{repo}/commit/{sha}"
+
+    valid_before = (
+        bool(before_sha)
+        and len(before_sha) >= 7
+        and before_sha != ZERO_SHA
+        and before_sha != sha
+        and event_name == "push"
+    )
+    fetched_compare = False
+    if github_token and repo and valid_before:
+        status, cmp_data = http_fn(
+            f"{api_base}/repos/{repo}/compare/{before_sha}...{sha}",
+            headers=gh_headers,
+            timeout=20,
+        )
+        if status == 200 and isinstance(cmp_data, dict):
+            fetched_compare = True
+            diff_url = cmp_data.get("html_url") or f"{server_url}/{repo}/compare/{before_sha[:7]}...{sha_short}"
+            for c in (cmp_data.get("commits") or [])[:30]:
+                c_msg = ((c.get("commit") or {}).get("message") or "").strip()
+                c_author = (
+                    (c.get("author") or {}).get("login")
+                    or ((c.get("commit") or {}).get("author") or {}).get("name")
+                    or ""
+                )
+                commits.append(
+                    {
+                        "sha": (c.get("sha") or "")[:7],
+                        "subject": clean_commit_message(c_msg),
+                        "author": c_author,
+                    }
+                )
+            files = cmp_data.get("files") or []
+
+    if github_token and repo and sha and not fetched_compare:
+        status, c_data = http_fn(f"{api_base}/repos/{repo}/commits/{sha}", headers=gh_headers, timeout=20)
+        if status == 200 and isinstance(c_data, dict):
+            diff_url = c_data.get("html_url") or diff_url
+            c_msg = ((c_data.get("commit") or {}).get("message") or "").strip()
+            c_author = (
+                (c_data.get("author") or {}).get("login")
+                or ((c_data.get("commit") or {}).get("author") or {}).get("name")
+                or actor
+            )
+            commits.append({"sha": sha_short, "subject": clean_commit_message(c_msg), "author": c_author})
+            files = c_data.get("files") or []
+
+    if not commits and head_commit_message:
+        commits.append({"sha": sha_short, "subject": clean_commit_message(head_commit_message), "author": actor})
+
+    total_add = sum(int(f.get("additions") or 0) for f in files)
+    total_del = sum(int(f.get("deletions") or 0) for f in files)
+    modules_str = summarize_modules(files)
+
+    diff_chunks: list[str] = []
+    remaining = 6000
+    for f in files:
+        fname = f.get("filename") or ""
+        if is_noisy_file(fname):
+            continue
+        patch = f.get("patch") or ""
+        chunk = (
+            f"### {fname} ({f.get('status', 'modified')}, +{f.get('additions', 0)}/-{f.get('deletions', 0)})\n"
+            + (patch[:1200] if patch else "(binary or large diff omitted)")
+            + "\n"
+        )
+        if len(chunk) > remaining:
+            if remaining > 200:
+                diff_chunks.append(chunk[:remaining] + "\n...[truncated]")
+            break
+        diff_chunks.append(chunk)
+        remaining -= len(chunk)
+
+    pr_label = ""
+    if prs:
+        pr_label = f"#{prs[0]['number']} {prs[0]['title']}"
+        if len(prs) > 1:
+            pr_label += f" 等 {len(prs)} 个 PR"
+
+    stats_text = f"{len(files)} 个文件 (+{total_add} / -{total_del})" if files else f"{len(commits)} 条提交"
+    if modules_str:
+        stats_text += f" · 模块: {modules_str}"
+
+    return {
+        "repo": repo,
+        "sha": sha,
+        "sha_short": sha_short,
+        "event_name": event_name,
+        "actor": actor,
+        "ref_name": ref_name or "main",
+        "diff_url": diff_url,
+        "prs": prs,
+        "pr_label": pr_label,
+        "commits": commits,
+        "files": [
+            {
+                "filename": f.get("filename") or "",
+                "status": f.get("status") or "modified",
+                "additions": int(f.get("additions") or 0),
+                "deletions": int(f.get("deletions") or 0),
+            }
+            for f in files[:30]
+        ],
+        "file_count": len(files),
+        "stats_text": stats_text,
+        "diff_excerpt": "\n".join(diff_chunks),
+    }
+
+
+def _direct_coolify_restart(coolify_url: str, coolify_token: str, uuids_csv: str, http_fn=http_json) -> tuple[bool, str]:
+    uuids = [u.strip() for u in (uuids_csv or "").split(",") if u.strip()]
+    if not uuids:
+        return True, "no uuids"
+    if not (coolify_url and coolify_token):
+        return False, "missing COOLIFY_URL or COOLIFY_TOKEN"
+    base = coolify_url.rstrip("/")
+    for u in uuids:
+        status, data = http_fn(
+            f"{base}/api/v1/services/{urllib.parse.quote(u, safe='')}/restart?latest=true",
+            method="POST",
+            headers={"Authorization": f"Bearer {coolify_token}"},
+            timeout=25,
+        )
+        if status not in (200, 201, 202):
+            return False, f"Coolify restart {u} HTTP {status}: {str(data)[:160]}"
+    return True, "ok"
+
+
+def _fallback_webhook_notify(webhook_url: str, title: str, lines: list[str], http_fn=http_json) -> None:
+    if not webhook_url:
+        return
+    text = "\n".join([title, *lines])
+    http_fn(webhook_url, method="POST", payload={"msg_type": "text", "content": {"text": text}}, timeout=15)
+
+
+def run_stage1(env: dict[str, str], http_fn=http_json) -> int:
+    repo = env["REPO_NAME"]
+    sha = env["GITHUB_SHA"]
+    sha_short = normalize_sha_short(sha)
+    actor = env.get("ACTOR", "")
+    ref_name = env.get("REF_NAME", "main")
+    run_url = env.get("RUN_URL", "")
+    server_url = env.get("SERVER_URL", "https://github.com")
+    image_name = (env.get("IMAGE_NAME") or f"ghcr.io/{repo}").lower()
+    deploy_workflow = env.get("DEPLOY_WORKFLOW", "deploy-approved.yml")
+    service_key = env.get("SERVICE_KEY", "")
+    coolify_uuid = env.get("COOLIFY_SERVICE_UUID", "")
+    job_status = env.get("JOB_STATUS", "success")
+    auto_deployed = env.get("AUTO_DEPLOYED", "false").lower() == "true"
+    require_approval = env.get("REQUIRE_APPROVAL", "true").lower() == "true"
+
+    ctx = collect_change_context(
+        repo=repo,
+        sha=sha,
+        before_sha=env.get("BEFORE_SHA", ""),
+        event_name=env.get("EVENT_NAME", "push"),
+        actor=actor,
+        ref_name=ref_name,
+        head_commit_message=env.get("HEAD_COMMIT_MSG", ""),
+        github_token=env.get("GITHUB_TOKEN", ""),
+        server_url=server_url,
+        http_fn=http_fn,
+    )
+
+    hub_url = (env.get("CI_HUB_URL") or "").strip().rstrip("/")
+    hub_token = (env.get("CI_HUB_TOKEN") or "").strip()
+
+    if hub_url and hub_token:
+        status, resp = http_fn(
+            f"{hub_url}/api/v1/stage1",
+            method="POST",
+            headers={"Authorization": f"Bearer {hub_token}"},
+            payload={
+                "repo": repo,
+                "sha": sha,
+                "ref_name": ref_name,
+                "actor": actor,
+                "run_url": run_url,
+                "image_name": image_name,
+                "deploy_workflow": deploy_workflow,
+                "service_key": service_key,
+                "coolify_service_uuid": coolify_uuid,
+                "job_status": job_status,
+                "auto_deployed": auto_deployed,
+                "require_approval": require_approval,
+                "change_context": ctx,
+            },
+            timeout=45,
+        )
+        print(json.dumps({"hub_http": status, "resp": resp}, ensure_ascii=False))
+        if status != 200 or (isinstance(resp, dict) and resp.get("coolify_ok") is False):
+            return 1
+        return 0
+
+    # Transition fallback before CI_HUB_URL / CI_HUB_TOKEN are configured
+    ok = job_status == "success"
+    err = ""
+    if ok and auto_deployed and coolify_uuid:
+        ok, err = _direct_coolify_restart(
+            env.get("COOLIFY_URL", ""), env.get("COOLIFY_TOKEN", ""), coolify_uuid, http_fn=http_fn
+        )
+    icon = "✅" if (ok and auto_deployed) else ("🟠" if ok else "🚨")
+    state_label = "部署成功" if (ok and auto_deployed) else ("待放行(过渡模式)" if ok else f"失败({err or job_status})")
+    commits_preview = "; ".join(c["subject"] for c in ctx["commits"][:3] if c.get("subject"))
+    _fallback_webhook_notify(
+        env.get("FEISHU_WEBHOOK_URL", ""),
+        f"{icon} [CI/CD {state_label}] {repo}" + (f" ({service_key})" if service_key else ""),
+        [
+            f"版本: sha-{sha_short} | 触发人: {actor} | 规模: {ctx['stats_text']}",
+            f"变更: {ctx['pr_label'] or commits_preview}",
+            f"Diff: {ctx['diff_url']}",
+            f"Actions: {run_url}",
+        ],
+        http_fn=http_fn,
+    )
+    return 0 if ok else 1
+
+
+def run_stage2(env: dict[str, str], http_fn=http_json) -> int:
+    repo = env["REPO_NAME"]
+    sha = env["TARGET_SHA"]
+    sha_short = normalize_sha_short(sha)
+    branch = env.get("REF_NAME", "main")
+    approver = env.get("APPROVER") or env.get("ACTOR", "")
+    trigger_actor = env.get("TRIGGER_ACTOR") or env.get("ACTOR", "")
+    card_message_id = env.get("CARD_MESSAGE_ID", "")
+    service_key = env.get("SERVICE_KEY", "")
+    coolify_uuid = env.get("COOLIFY_SERVICE_UUID", "")
+    run_url = env.get("RUN_URL", "")
+    server_url = env.get("SERVER_URL", "https://github.com")
+    job_status = env.get("JOB_STATUS", "success")
+
+    summary_text = (env.get("SUMMARY_TEXT") or "").strip()
+    diff_url = (env.get("DIFF_URL") or "").strip()
+    ctx: dict[str, Any] = {}
+    if not summary_text or not diff_url:
+        ctx = collect_change_context(
+            repo=repo,
+            sha=sha,
+            before_sha="",
+            event_name="workflow_dispatch",
+            actor=trigger_actor or approver,
+            ref_name=branch,
+            head_commit_message="",
+            github_token=env.get("GITHUB_TOKEN", ""),
+            server_url=server_url,
+            http_fn=http_fn,
+        )
+
+    hub_url = (env.get("CI_HUB_URL") or "").strip().rstrip("/")
+    hub_token = (env.get("CI_HUB_TOKEN") or "").strip()
+
+    if hub_url and hub_token:
+        status, resp = http_fn(
+            f"{hub_url}/api/v1/stage2",
+            method="POST",
+            headers={"Authorization": f"Bearer {hub_token}"},
+            payload={
+                "repo": repo,
+                "sha": sha,
+                "branch": branch,
+                "approver": approver,
+                "trigger_actor": trigger_actor,
+                "card_message_id": card_message_id,
+                "service_key": service_key,
+                "summary_text": summary_text,
+                "summary_source": env.get("SUMMARY_SOURCE", ""),
+                "diff_url": diff_url,
+                "stats_text": env.get("STATS_TEXT", ""),
+                "pr_label": env.get("PR_LABEL", ""),
+                "run_url": run_url,
+                "coolify_service_uuid": coolify_uuid,
+                "job_status": job_status,
+                "change_context": ctx,
+            },
+            timeout=45,
+        )
+        print(json.dumps({"hub_http": status, "resp": resp}, ensure_ascii=False))
+        if status != 200 or (isinstance(resp, dict) and resp.get("coolify_ok") is False):
+            return 1
+        return 0
+
+    ok = job_status == "success"
+    err = ""
+    if ok and coolify_uuid:
+        ok, err = _direct_coolify_restart(
+            env.get("COOLIFY_URL", ""), env.get("COOLIFY_TOKEN", ""), coolify_uuid, http_fn=http_fn
+        )
+    _fallback_webhook_notify(
+        env.get("FEISHU_WEBHOOK_URL", ""),
+        f"{'✅ 部署成功' if ok else f'🚨 部署失败({err or job_status})'} {repo} (sha-{sha_short})",
+        [f"放行人: {approver}", f"Actions: {run_url}"],
+        http_fn=http_fn,
+    )
+    return 0 if ok else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = argv if argv is not None else sys.argv[1:]
+    if not args or args[0] not in ("stage1", "stage2"):
+        print("Usage: ci_hub_client.py <stage1|stage2>", file=sys.stderr)
+        return 2
+    env = dict(os.environ)
+    return run_stage1(env) if args[0] == "stage1" else run_stage2(env)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
