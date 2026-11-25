@@ -32,9 +32,22 @@ on:
         type: string
         default: ""
       coolify_uuid_secret_name:
-        description: "Name of the repository secret containing Coolify service UUID(s)"
+        description: "Optional secret name override when using same-org secrets: inherit"
         type: string
         default: "COOLIFY_SERVICE_UUID"
+    secrets:
+      CI_HUB_URL:
+        required: false
+      CI_HUB_TOKEN:
+        required: false
+      COOLIFY_SERVICE_UUID:
+        required: false
+      COOLIFY_URL:
+        required: false
+      COOLIFY_TOKEN:
+        required: false
+      FEISHU_WEBHOOK_URL:
+        required: false
 
 permissions:
   contents: read
@@ -117,7 +130,7 @@ jobs:
           IMAGE_NAME: ${{ steps.gate.outputs.image_name }}
           DEPLOY_WORKFLOW: ${{ inputs.deploy_workflow }}
           SERVICE_KEY: ${{ inputs.service_key }}
-          COOLIFY_SERVICE_UUID: ${{ secrets[inputs.coolify_uuid_secret_name] }}
+          COOLIFY_SERVICE_UUID: ${{ secrets.COOLIFY_SERVICE_UUID || secrets[inputs.coolify_uuid_secret_name] }}
           JOB_STATUS: ${{ job.status }}
           AUTO_DEPLOYED: ${{ steps.gate.outputs.auto_deploy }}
           REQUIRE_APPROVAL: ${{ inputs.require_approval }}
