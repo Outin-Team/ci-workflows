@@ -91,6 +91,19 @@ class TestHubClient(unittest.TestCase):
         for wf in embed.WORKFLOWS:
             self.assertTrue(embed.sync_file(wf, source, check_only=True))
 
+    def test_workflow_call_schema_keys(self) -> None:
+        for wf in embed.WORKFLOWS:
+            text = wf.read_text(encoding="utf-8")
+            # Ensure secrets block appears AFTER inputs block and contains no input-only keys like 'type:'
+            sec_idx = text.index("    secrets:\n")
+            perm_idx = text.index("\npermissions:\n")
+            sec_block = text[sec_idx:perm_idx]
+            self.assertIn("CI_HUB_URL:", sec_block)
+            self.assertIn("CI_HUB_TOKEN:", sec_block)
+            self.assertIn("COOLIFY_SERVICE_UUID:", sec_block)
+            self.assertNotIn("type:", sec_block)
+            self.assertNotIn("default:", sec_block)
+
 
 if __name__ == "__main__":
     unittest.main()

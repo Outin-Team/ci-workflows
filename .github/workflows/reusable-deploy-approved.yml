@@ -19,19 +19,6 @@ on:
         description: "Optional secret name override when using same-org secrets: inherit"
         type: string
         default: "COOLIFY_SERVICE_UUID"
-    secrets:
-      CI_HUB_URL:
-        required: false
-      CI_HUB_TOKEN:
-        required: false
-      COOLIFY_SERVICE_UUID:
-        required: false
-      COOLIFY_URL:
-        required: false
-      COOLIFY_TOKEN:
-        required: false
-      FEISHU_WEBHOOK_URL:
-        required: false
       approver:
         description: "Approver display name"
         type: string
@@ -64,6 +51,19 @@ on:
         description: "Associated PR label"
         type: string
         default: ""
+    secrets:
+      CI_HUB_URL:
+        required: false
+      CI_HUB_TOKEN:
+        required: false
+      COOLIFY_SERVICE_UUID:
+        required: false
+      COOLIFY_URL:
+        required: false
+      COOLIFY_TOKEN:
+        required: false
+      FEISHU_WEBHOOK_URL:
+        required: false
 
 permissions:
   contents: read
